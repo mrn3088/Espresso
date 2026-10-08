@@ -58,6 +58,53 @@ fmt_clock() {
     else date -r "$1" '+%a %H:%M'; fi
 }
 
+# 从 `pmset -g batt` 的输出(stdin)取当前供电:AC / Battery / UPS / Unknown
+# 要读完全部输出:低电量时 pmset 分两次写,只读一行就退出会让它收到 SIGPIPE
+parse_power_source() {
+    local line src=Unknown drain=
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            *"Now drawing from 'AC Power'"*)       src=AC ;;
+            *"Now drawing from 'Battery Power'"*)  src=Battery ;;
+            *"Now drawing from 'UPS Power'"*)      src=UPS ;;
+            *"-InternalBattery-"*"; discharging"*) drain=Battery ;;
+            *"; discharging"*)                     drain="${drain:-UPS}" ;;
+        esac
+    done
+    # 沙箱里连不上 notifyd 时 pmset 会回落成 'AC Power';电源行的 discharging 来自 powerd,以它为准
+    if [ "$src" = AC ] && [ -n "$drain" ]; then src="$drain"; fi
+    printf '%s\n' "$src"
+}
+
+# 供电只是附加信息:pmset 失败时得到 Unknown,不影响调用方
+power_source() {
+    local out
+    out="$($PMSET -g batt 2>/dev/null)" || true
+    parse_power_source <<< "$out"
+}
+
+# power_label <AC|Battery|UPS|Unknown> -> 按界面语言显示
+power_label() {
+    case "$1" in
+        AC)      msg "AC" "电源适配器" ;;
+        Battery) msg "Battery" "电池" ;;
+        UPS)     msg "UPS" "UPS" ;;
+        *)       msg "Unknown" "未知" ;;
+    esac
+}
+
+# 电池 / UPS 供电时提醒可能耗尽电量;只提醒,不改变防休眠状态和退出码
+warn_limited_power() {
+    case "$1" in
+        Battery)
+            msg "WARNING: no-sleep is active on battery power — the Mac will keep running and may drain the battery." \
+                "警告:正在用电池供电且防休眠开启 —— Mac 会持续运行,可能耗尽电量" ;;
+        UPS)
+            msg "WARNING: no-sleep is active on UPS power — the Mac will keep running and may drain the UPS." \
+                "警告:正在用 UPS 供电且防休眠开启 —— Mac 会持续运行,可能耗尽 UPS 电量" ;;
+    esac
+}
+
 # 读截止时间;没有 / 内容非法则返回 1
 read_deadline() {
     local d
@@ -110,7 +157,7 @@ usage() {
   for <时长> 定时防休眠,到点自动恢复睡眠;如 for 90m / for 2h / for 1h30m(最长 7 天)
   off        恢复正常睡眠(同时取消定时)
   toggle     切换开关
-  status     查看状态、剩余时间;开启时退出码 0,关闭时退出码 1(方便脚本判断)
+  status     查看状态、剩余时间、供电;开启时退出码 0,关闭时退出码 1(方便脚本判断)
 EOF
     else
         cat <<'EOF'
@@ -121,7 +168,7 @@ Usage: espresso <command>
                  e.g. for 90m / for 2h / for 1h30m (max 7 days)
   off            restore normal sleep (cancels any timer)
   toggle         flip the switch
-  status         show state and time left;
+  status         show state, time left, power source;
                  exit code 0 = on, 1 = off (script-friendly)
 EOF
     fi
@@ -137,6 +184,7 @@ do_on() {
     fi
     msg "No-sleep ON (SleepDisabled=1) — stays awake even lid-closed" \
         "防休眠已开启 SleepDisabled=1(合盖也不睡)"
+    warn_limited_power "$(power_source)" >&2
 }
 
 do_off() {
@@ -177,6 +225,7 @@ do_for() {
     fi
     msg "No-sleep ON for $(fmt_minutes "$mins") — normal sleep returns at $(fmt_clock "$deadline")" \
         "防休眠已开启 $(fmt_minutes "$mins"),将于 $(fmt_clock "$deadline") 自动恢复正常睡眠"
+    warn_limited_power "$(power_source)" >&2
 }
 
 # LaunchAgent 定时调用:到点关防休眠;计时已取消 / 已被别处关掉则清理自身
@@ -191,7 +240,7 @@ do_tick() {
 }
 
 do_status() {
-    local deadline now left
+    local deadline now left src label rc=0
     if is_on; then
         msg "on  (SleepDisabled=1, no-sleep active)" \
             "on  (SleepDisabled=1,防休眠中)"
@@ -211,8 +260,13 @@ do_status() {
     else
         msg "off (SleepDisabled=0, normal sleep)" \
             "off (SleepDisabled=0,正常睡眠)"
-        return 1
+        rc=1
     fi
+    src="$(power_source)"
+    label="$(power_label "$src")"
+    msg "power: $label" "供电:$label"
+    if [ "$rc" = 0 ]; then warn_limited_power "$src"; fi
+    return "$rc"
 }
 
 # 被 source 时(如测试)只加载函数,不执行命令

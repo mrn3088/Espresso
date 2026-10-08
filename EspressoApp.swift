@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import IOKit.ps
+import notify
 
 // MARK: - 界面语言(默认英文,选择持久化到 UserDefaults)
 
@@ -16,6 +18,21 @@ enum UILang: String, CaseIterable, Identifiable {
     var quit: String      { self == .zh ? "退出" : "Quit" }
     var duration: String  { self == .zh ? "时长" : "Duration" }
     var untilOff: String  { self == .zh ? "直到手动关闭" : "Until turned off" }
+    // 有限电源的名称;外接电源时为 nil
+    func powerName(_ p: PowerSource) -> String? {
+        switch p {
+        case .ac:      return nil
+        case .battery: return self == .zh ? "电池" : "Battery"
+        case .ups:     return "UPS"
+        }
+    }
+    func powerWarning(_ p: PowerSource) -> String {
+        p == .ups
+            ? (self == .zh ? "正在使用 UPS 供电:防休眠会继续保持,可能耗尽 UPS 电量"
+                           : "On UPS power — no-sleep stays on and may drain the UPS")
+            : (self == .zh ? "正在使用电池:防休眠会继续保持,可能耗尽电量"
+                           : "On battery — no-sleep stays on and may drain the battery")
+    }
     func hours(_ h: Int) -> String { self == .zh ? "\(h) 小时" : (h == 1 ? "1 hour" : "\(h) hours") }
     // 时间跟随 app 界面语言,而不是系统区域(否则英文界面里会出现「上午12:30」)
     func clock(_ date: Date) -> String {
@@ -32,6 +49,23 @@ enum UILang: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - 供电来源:电池和 UPS 都是有限电源,防休眠开着会耗尽电量
+
+enum PowerSource {
+    case ac, battery, ups
+
+    static func current() -> PowerSource {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue()
+        else { return .ac }
+        switch type as String {
+        case kIOPMBatteryPowerKey: return .battery
+        case kIOPMUPSPowerKey:     return .ups
+        default:                   return .ac
+        }
+    }
+}
+
 // MARK: - 状态模型:读写 pmset disablesleep
 
 final class SleepModel: ObservableObject {
@@ -39,6 +73,7 @@ final class SleepModel: ObservableObject {
 
     @Published var sleepDisabled = false   // true = no-sleep(防休眠开启)
     @Published var deadline: Date?         // 定时模式的自动关闭时间
+    @Published var power = PowerSource.ac
     @Published var busy = false
     @Published var lastError: String?
     @Published var uiLang: UILang {
@@ -53,12 +88,19 @@ final class SleepModel: ObservableObject {
     private let deadlineFile = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Espresso/timer-deadline")
     private var pollTimer: Timer?
+    private var powerToken: Int32 = 0
 
     init() {
         let saved = UserDefaults.standard.string(forKey: "uiLang")
         uiLang = saved.flatMap(UILang.init(rawValue:)) ?? .en
         let mins = UserDefaults.standard.integer(forKey: "durationMinutes")
         durationMinutes = Self.durations.contains(mins) ? mins : 0
+        // 供电来源切换(拔插电源、UPS 断电)时系统通知;电量变化不会触发。
+        // 结果投递到 main 队列,菜单展开(event tracking)期间也会执行
+        notify_register_dispatch(kIOPSNotifyPowerSource, &powerToken, .global(qos: .utility)) { [weak self] _ in
+            let power = PowerSource.current()
+            DispatchQueue.main.async { self?.setPower(power) }
+        }
         // CLI / 定时到点等外部变化:低频轮询,保证菜单栏图标不过期
         pollTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -66,16 +108,28 @@ final class SleepModel: ObservableObject {
         refresh()
     }
 
+    deinit {
+        notify_cancel(powerToken)
+        pollTimer?.invalidate()
+    }
+
+    private func setPower(_ p: PowerSource) {
+        if power != p { power = p }
+    }
+
     func refresh() {
         DispatchQueue.global(qos: .userInitiated).async {
+            // 供电也在后台读,不依赖 pmset 是否成功;通知漏掉时由轮询兜底
+            let power = PowerSource.current()
             let (code, out) = Self.run(["/usr/bin/pmset", "-g"])
-            guard code == 0 else { return }
             let disabled = out.range(of: #"SleepDisabled\s+1"#,
                                      options: .regularExpression) != nil
             let deadline = (try? String(contentsOf: self.deadlineFile, encoding: .utf8))
                 .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
                 .map(Date.init(timeIntervalSince1970:))
             DispatchQueue.main.async {
+                self.setPower(power)
+                guard code == 0 else { return }
                 self.sleepDisabled = disabled
                 self.deadline = disabled ? deadline : nil
             }
@@ -195,6 +249,21 @@ struct ContentView: View {
             .font(.caption)
             .disabled(model.busy)
 
+            if model.sleepDisabled && model.power != .ac {
+                // 文字用默认前景色:橙字配浅橙底在浅色模式下对比度只有约 2:1
+                Label {
+                    Text(model.uiLang.powerWarning(model.power))
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                }
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.12)))
+            }
+
             if let err = model.lastError {
                 Text(err)
                     .font(.caption2)
@@ -205,7 +274,7 @@ struct ContentView: View {
 
             Divider()
             HStack {
-                Text("SleepDisabled = \(model.sleepDisabled ? 1 : 0)")
+                Text(verbatim: footer)
                     .font(.caption2)
                     .foregroundColor(.secondary)
                 Spacer()
@@ -219,6 +288,13 @@ struct ContentView: View {
         .onAppear { model.refresh() }
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.didBecomeActiveNotification)) { _ in model.refresh() }
+    }
+
+    // 页脚:SleepDisabled 原始值,有限电源时附上来源
+    private var footer: String {
+        let base = "SleepDisabled = \(model.sleepDisabled ? 1 : 0)"
+        guard let name = model.uiLang.powerName(model.power) else { return base }
+        return "\(base) · \(name)"
     }
 
     // 剩余时间 -> "1h 23m" / "4m" / "<1m"
@@ -240,7 +316,9 @@ struct EspressoApp: App {
         MenuBarExtra {
             ContentView(model: model)
         } label: {
-            Image(systemName: model.sleepDisabled ? "cup.and.saucer.fill" : "cup.and.saucer")
+            // 防休眠开着又在用电池 / UPS 时换成警告图标,面板关着也能看到
+            Image(systemName: !model.sleepDisabled ? "cup.and.saucer"
+                  : model.power == .ac ? "cup.and.saucer.fill" : "exclamationmark.triangle.fill")
         }
         .menuBarExtraStyle(.window)
     }

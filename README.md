@@ -44,10 +44,12 @@ espresso on       # 开启防休眠(合盖也不睡),直到手动关闭
 espresso for 2h   # 定时防休眠,到点自动恢复睡眠(支持 90m、2h、1h30m,最长 7 天)
 espresso off      # 恢复正常睡眠(同时取消定时)
 espresso toggle   # 切换
-espresso status   # 查看状态、剩余时间;开启时退出码 0,关闭时 1,方便脚本判断
+espresso status   # 查看状态、剩余时间、供电;开启时退出码 0,关闭时 1,方便脚本判断
 ```
 
 **定时会话**:`for` 会立即开启防休眠,并装一个用户级 LaunchAgent(`~/Library/LaunchAgents/com.mrn3088.espresso.timer.plist`),每 30 秒检查一次,到点执行 `pmset -a disablesleep 0` 后自动删除自己。它不依赖菜单栏 app 或终端——关掉 app、关掉终端、甚至重启登录后都照样到点关闭。`on` / `off` 会取消正在进行的定时;再次 `for` 会用新时长覆盖。首次使用时 macOS 可能弹「已添加后台项目」通知,属正常现象。
+
+**电池提醒**:防休眠开启且 Mac 正在用电池(或 UPS)供电时,菜单栏图标会变成警告三角,面板里显示提醒;`espresso status` 会给出警告,用电池时执行 `espresso on` / `for` 也会在 stderr 提醒(不影响退出码)。Espresso **不会**因为拔掉电源而自动关闭防休眠(不打断正在跑的 agent),只是提醒你可能会耗尽电量。
 
 `status` 的退出码让脚本可以这么写:
 
@@ -133,10 +135,12 @@ espresso for 2h   # no-sleep for a while, then sleep is restored automatically
                   # (accepts 90m, 2h, 1h30m; max 7 days)
 espresso off      # back to normal sleep (cancels any timer)
 espresso toggle   # flip the switch
-espresso status   # state and time left; exit code 0 = on, 1 = off
+espresso status   # state, time left, power source; exit code 0 = on, 1 = off
 ```
 
 **Timed sessions**: `for` turns no-sleep on immediately and installs a per-user LaunchAgent (`~/Library/LaunchAgents/com.mrn3088.espresso.timer.plist`) that checks every 30 seconds; when time is up it runs `pmset -a disablesleep 0` and removes itself. It does not depend on the menu bar app or the terminal — quitting the app, closing the terminal, or even rebooting and logging back in won't stop the auto-off. `on` and `off` cancel a running timer; another `for` replaces it with the new duration. macOS may show a "Background Items Added" notification the first time; that is expected.
+
+**Battery warning**: when no-sleep is on and the Mac is running on battery (or UPS) power, the menu bar icon turns into a warning triangle and the panel shows a warning; `espresso status` prints one, and `espresso on` / `for` print one to stderr when started on battery (the exit code is unaffected). Espresso does **not** turn itself off when you unplug (it won't interrupt a running agent) — it just tells you the battery may drain.
 
 The `status` exit code enables patterns like:
 
